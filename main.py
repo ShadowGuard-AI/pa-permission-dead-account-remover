@@ -2,8 +2,9 @@
 import argparse
 import logging
 import os
+import pwd
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 try:
     import pathspec
@@ -25,7 +26,7 @@ def setup_argparse() -> argparse.ArgumentParser:
         argparse.ArgumentParser: The configured argument parser.
     """
     parser = argparse.ArgumentParser(
-        description="Identifies and removes permissions associated with inactive or terminated user accounts."
+        description="Identifies and reports files that are candidates for permission removal because they are owned by inactive or terminated user accounts, or by an owner uid with no account. This tool changes nothing: it only reports candidates."
     )
 
     parser.add_argument(
@@ -33,7 +34,7 @@ def setup_argparse() -> argparse.ArgumentParser:
         "--directory",
         type=str,
         required=True,
-        help="The directory to analyze and modify permissions in.",
+        help="The directory to analyze and report candidates in. Nothing in it is changed.",
     )
 
     parser.add_argument(
@@ -48,7 +49,7 @@ def setup_argparse() -> argparse.ArgumentParser:
         "-r",
         "--remove",
         action="store_true",
-        help="Remove permissions for the inactive users.  Without this flag, the tool only identifies them.",
+        help="Report removal candidates for the inactive users. This mode reports candidates only and changes no permissions. Without this flag, the tool identifies candidate files in the same way.",
     )
 
     parser.add_argument(
@@ -121,77 +122,74 @@ def load_excludes(exclude_file: str) -> pathspec.PathSpec:
         raise
 
 
-def check_permissions(directory: str, users: List[str], exclude_spec: Optional[pathspec.PathSpec] = None) -> List[str]:
+def candidate_basis(filepath: str, users: List[str]) -> Optional[str]:
     """
-    Checks permissions in the given directory for the specified users.
+    Returns why a file is a candidate, or None when it is not.
 
-    Args:
-        directory (str): The directory to check.
-        users (List[str]): A list of usernames to check for.
-        exclude_spec (Optional[pathspec.PathSpec]): A pathspec object for excluding paths.
+    A file is a candidate when its owner, read with os.stat and resolved
+    with pwd, is one of the named users, or when its owner uid resolves
+    to no account at all. The file path itself is never used as a test.
+    """
+    uid = os.stat(filepath).st_uid
+    try:
+        owner = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f"owner uid {uid} has no account"
+    if owner in users:
+        return f"owned by named user {owner} (uid {uid})"
+    return None
+
+
+def find_candidates(directory: str, users: List[str], exclude_spec: Optional[pathspec.PathSpec] = None) -> Tuple[List[Tuple[str, str]], int]:
+    """
+    Finds candidate files in the given directory for the specified users.
 
     Returns:
-        List[str]: A list of files where the users have permissions.
+        A pair: a list of (filepath, basis) candidates, and the number
+        of files scanned.
     """
-    files_with_permissions = []
+    candidates = []
+    scanned = 0
     for root, _, files in os.walk(directory):
         for file in files:
             filepath = os.path.join(root, file)
 
-            # Check if the path is excluded
             if exclude_spec and exclude_spec.match_file(filepath):
                 logging.debug(f"Skipping excluded path: {filepath}")
                 continue
 
+            scanned += 1
             try:
-                # Check permissions (This part is intentionally simplified; real-world implementation would involve actual permission checking)
-                # In a real scenario, this would involve os.stat, ACL checks, etc.
-                # The following is a placeholder:
-                has_permissions = any(user.lower() in filepath.lower() for user in users)  # Placeholder check
-                if has_permissions:
-                    files_with_permissions.append(filepath)
-                    logging.info(f"User(s) found with permissions for file: {filepath}")
+                basis = candidate_basis(filepath, users)
+                if basis:
+                    candidates.append((filepath, basis))
+                    logging.info(f"Candidate file: {filepath} ({basis})")
             except Exception as e:
-                logging.error(f"Error checking permissions for {filepath}: {e}")
+                logging.error(f"Error checking ownership for {filepath}: {e}")
 
-    return files_with_permissions
+    return candidates, scanned
 
 
-def remove_permissions(directory: str, users: List[str], exclude_spec: Optional[pathspec.PathSpec] = None) -> None:
+def check_permissions(directory: str, users: List[str], exclude_spec: Optional[pathspec.PathSpec] = None) -> Tuple[List[Tuple[str, str]], int]:
+    """Identifies candidate files. Changes nothing."""
+    return find_candidates(directory, users, exclude_spec)
+
+
+def report_removal_candidates(directory: str, users: List[str], exclude_spec: Optional[pathspec.PathSpec] = None) -> Tuple[List[Tuple[str, str]], int]:
     """
-    Removes permissions for the specified users in the given directory.
-
-    Args:
-        directory (str): The directory to modify.
-        users (List[str]): A list of usernames to remove permissions for.
-        exclude_spec (Optional[pathspec.PathSpec]): A pathspec object for excluding paths.
+    Reports removal candidate files. Changes nothing: no permission,
+    ACL, or account state is modified by this tool in any mode.
     """
-    for root, _, files in os.walk(directory):
-        for file in files:
-            filepath = os.path.join(root, file)
-
-            # Check if the path is excluded
-            if exclude_spec and exclude_spec.match_file(filepath):
-                logging.debug(f"Skipping excluded path: {filepath}")
-                continue
-
-            try:
-                # Remove permissions (This part is intentionally simplified; real-world implementation would involve actual permission removal)
-                # In a real scenario, this would involve os.chmod, ACL modifications, etc.
-                # The following is a placeholder:
-                if any(user.lower() in filepath.lower() for user in users):  # Placeholder check
-                    print(f"Removing permissions for users {users} from {filepath}")
-                    logging.info(f"Removing permissions for users {users} from {filepath}")
-                    # In a real implementation, the permission removal logic would go here.
-                    # Example (UNSAFE AND DOES NOT WORK DIRECTLY - illustrates the idea):
-                    # os.chmod(filepath, 0o755)  # Removes write access for everyone except owner
-            except Exception as e:
-                logging.error(f"Error removing permissions for {filepath}: {e}")
+    candidates, scanned = find_candidates(directory, users, exclude_spec)
+    for filepath, basis in candidates:
+        print(f"Removal candidate: {filepath} ({basis}). No permissions were changed.")
+        logging.info(f"Removal candidate: {filepath} ({basis}). No permissions were changed.")
+    return candidates, scanned
 
 
 def main() -> None:
     """
-    Main function to execute the permission assessment and removal tool.
+    Main function to execute the candidate identification and reporting tool.
     """
     parser = setup_argparse()
     args = parser.parse_args()
@@ -215,6 +213,11 @@ def main() -> None:
         rprint(f"[red]Error: Could not read user file.[/red]")
         sys.exit(1)
 
+    if not users:
+        rprint("[red]Error: The user list is empty. No users were named, so no report was run.[/red]")
+        logging.error("Empty user list refused at startup.")
+        sys.exit(1)
+
     exclude_spec = None
     if args.exclude:
         try:
@@ -233,20 +236,35 @@ def main() -> None:
         sys.exit(1)
 
     if args.remove:
-        rprint("[yellow]Removing permissions...[/yellow]")
-        remove_permissions(args.directory, users, exclude_spec)
-        rprint("[green]Permissions removal process completed.[/green]")
-        logging.info("Permissions removal process completed.")
+        rprint("[yellow]Reporting removal candidates. This tool changes nothing.[/yellow]")
+        candidates, scanned = report_removal_candidates(args.directory, users, exclude_spec)
+        rprint(f"[yellow]Files scanned: {scanned}. Removal candidates matched: {len(candidates)}.[/yellow]")
+        if scanned == 0:
+            rprint("[red]No files were scanned. Nothing matched.[/red]")
+            logging.error("Remove report run scanned no files.")
+            sys.exit(1)
+        if not candidates:
+            rprint("[red]Nothing matched. No removal candidates were found.[/red]")
+            logging.error("Remove report run matched nothing.")
+            sys.exit(1)
+        rprint("[green]Removal candidate reporting completed. No permissions were changed.[/green]")
+        logging.info("Removal candidate reporting completed. No permissions were changed.")
     else:
-        rprint("[yellow]Checking permissions...[/yellow]")
-        files_with_permissions = check_permissions(args.directory, users, exclude_spec)
-        if files_with_permissions:
-            rprint("[red]The following files have permissions for the specified users:[/red]")
-            for file in files_with_permissions:
-                rprint(f"[blue]{file}[/blue]")
+        rprint("[yellow]Identifying candidate files. This tool changes nothing.[/yellow]")
+        candidates, scanned = check_permissions(args.directory, users, exclude_spec)
+        rprint(f"[yellow]Files scanned: {scanned}. Candidate files matched: {len(candidates)}.[/yellow]")
+        if scanned == 0:
+            rprint("[red]No files were scanned. Nothing matched.[/red]")
+            logging.error("Check run scanned no files.")
+            sys.exit(1)
+        if candidates:
+            rprint("[red]The following files are candidates because of their ownership:[/red]")
+            for filepath, basis in candidates:
+                rprint(f"[blue]{filepath} ({basis})[/blue]")
         else:
-            rprint("[green]No files found with permissions for the specified users.[/green]")
-        logging.info("Permissions check completed.")
+            rprint("[green]No candidate files found for the specified users.[/green]")
+        rprint("[green]Candidate identification completed. No permissions were changed.[/green]")
+        logging.info("Candidate identification completed. No permissions were changed.")
 
 if __name__ == "__main__":
     main()
