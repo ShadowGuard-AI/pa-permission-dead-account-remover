@@ -130,6 +130,7 @@ def candidate_basis(filepath: str, users: List[str]) -> Optional[str]:
     with pwd, is one of the named users, or when its owner uid resolves
     to no account at all. The file path itself is never used as a test.
     """
+    # os.stat follows symlinks, so a link inside the tree is judged by the owner of the file it points at, which can be outside the directory I was asked to scan. The path I report is the link, but the ownership I tested belongs to its target.
     uid = os.stat(filepath).st_uid
     try:
         owner = pwd.getpwuid(uid).pw_name
@@ -150,6 +151,7 @@ def find_candidates(directory: str, users: List[str], exclude_spec: Optional[pat
     """
     candidates = []
     scanned = 0
+    # I only ever test files. A directory owned by a dead account is never a candidate in my report, even though an empty leftover directory is often exactly what an account cleanup needs to know about.
     for root, _, files in os.walk(directory):
         for file in files:
             filepath = os.path.join(root, file)
@@ -158,6 +160,7 @@ def find_candidates(directory: str, users: List[str], exclude_spec: Optional[pat
                 logging.debug(f"Skipping excluded path: {filepath}")
                 continue
 
+            # The count goes up before the ownership test runs, so a file that vanishes mid walk or fails stat is counted as scanned and then quietly skipped through the error handler below. Excluded files never reach this line, so they are not in the scanned total at all.
             scanned += 1
             try:
                 basis = candidate_basis(filepath, users)
@@ -237,6 +240,7 @@ def main() -> None:
 
     if args.remove:
         rprint("[yellow]Reporting removal candidates. This tool changes nothing.[/yellow]")
+        # The two modes run the identical scan; only the exit codes differ. This remove branch exits 1 when nothing matches, while the identify branch below treats the same empty result as a clean finish. I keep that asymmetry visible here because a wrapper script will read these codes as opposite verdicts on the same facts.
         candidates, scanned = report_removal_candidates(args.directory, users, exclude_spec)
         rprint(f"[yellow]Files scanned: {scanned}. Removal candidates matched: {len(candidates)}.[/yellow]")
         if scanned == 0:
